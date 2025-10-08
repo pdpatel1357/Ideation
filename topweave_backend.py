@@ -4,81 +4,73 @@ import io
 from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+import json
 
 # Initialize the FastAPI application
 app = FastAPI(title="Data Center Cutsheet Processor")
 
-# --- 1. Data Import Function ---
+# ==============================================================================
+# 1. CORE DATA PROCESSING FUNCTIONS (Your existing code)
+#    Note: These functions need to be defined *before* the API endpoint uses them.
+# ==============================================================================
 
-def import_cutsheet(file_name: str) -> Optional[pd.DataFrame]:
-    """Imports CSV data into a DataFrame with specified column names."""
+# --- 1. Data Import Function (Modified for in-memory processing) ---
+
+def import_cutsheet_from_bytes(file_content: bytes) -> Optional[pd.DataFrame]:
+    """Reads CSV data from bytes content into a DataFrame."""
     columns = [
-        "A-SIDE LOCODE", "A-LOC:CAB:RU", "A-SIDE-DNS-NAME", "A-MODEL", "A-PORT",
+        "id", "A-SIDE LOCODE", "A-LOC:CAB:RU", "A-SIDE-DNS-NAME", "A-MODEL", "A-PORT",
         "A-BREAKOUT LOC:CAB:RU", "A-BREAKOUT SLOT:PORT", "A-OPTIC", "A-PATCH-PANEL LOC:CAB:RU:PORT",
         "Z-SIDE LOCODE", "Z-LOC:CAB:RU", "Z-SIDE-DNS-NAME", "Z-MODEL", "Z-PORT",
         "Z-BREAKOUT LOC:CAB:RU", "Z-BREAKOUT SLOT:PORT", "Z-OPTIC", "Z-PATCH-PANEL LOC:CAB:RU:PORT",
         "CABLE"
     ]
-
     try:
-        df = pd.read_csv(file_name, header=None, names=columns)
-        return df
-    except FileNotFoundError:
-        print(f"File '{file_name}' not found.")
-        return None
-    except pd.errors.EmptyDataError:
-        print(f"File '{file_name}' is empty.")
-        return None
-    except pd.errors.ParserError as e:
-        print(f"Error parsing file '{file_name}': {e}")
-        return None
+        # Decode bytes to string and use StringIO to treat it like a file
+        s = io.StringIO(file_content.decode('utf-8'))
+        # df = pd.read_csv(s, header=None, names=columns)
+        df = pd.read_csv(s, header=None, skiprows=1, names=columns, skipinitialspace=True)
+        df.columns = df.columns.str.strip()
+
+        df['id'] = df['id'].ffill()
+
+        df_filtered = df[df['A-SIDE LOCODE'].notna()].copy()
+        df_filtered = df_filtered.reset_index(drop=True)
+        
+        return df_filtered
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        # General error for parsing issues
+        print(f"Error reading or parsing file content: {e}")
         return None
 
 # ----------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (No change needed here)
 # ----------------------------------------------------------------------
 
 def split_dns_cfn(dns_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """
-    Helper: Splits full DNS into Base DNS (everything before CFN) and 
-    the 3-part CFN using the last 3 hyphens.
-    """
+    """Helper: Splits full DNS into Base DNS and 3-part CFN using the last 3 hyphens."""
     parts = dns_series.str.rsplit('-', n=3, expand=True)
     base_dns = parts[0]
-    
-    # Recombine the 3 CFN parts
     cfn = parts[1].fillna('') + '-' + parts[2].fillna('') + '-' + parts[3].fillna('')
     return base_dns, cfn.str.strip('-')
 
 def extract_loc_code(base_dns: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """
-    Helper: Conditionally extracts the 'dh' LOC code from the start of the 
-    Base DNS and returns the separated LOC and the cleaned Base DNS.
-    """
+    """Helper: Conditionally extracts the 'dh' LOC code from the start of the Base DNS."""
     loc = pd.Series(pd.NA, index=base_dns.index)
     clean_base_dns = base_dns.copy()
-
-    # Conditional check: only split if the string starts with 'dh'
     should_split = clean_base_dns.str.startswith('dh', na=False)
-    
-    # Perform split only on matching rows (n=1 separates LOC from the rest)
     parts = clean_base_dns[should_split].str.split('-', n=1, expand=True)
-
-    # Assign the split parts
     loc.loc[should_split] = parts[0]
     clean_base_dns.loc[should_split] = parts[1]
-
     return loc, clean_base_dns
 
 # ----------------------------------------------------------------------
-# MAIN PROCESSING STEP FUNCTIONS
+# MAIN PROCESSING STEP FUNCTIONS (Corrected variable name in process_location_columns)
 # ----------------------------------------------------------------------
 
 def process_location_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Applies split logic to A/Z-LOC:CAB:RU columns."""
-    if df is None:
+    if org_df is None: # FIX: Changed check to org_df
         print("Cannot process location columns: Input DataFrame is None.")
         return None
         
@@ -89,7 +81,7 @@ def process_location_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if org_col in df.columns:
             try:
                 new_cols = df[org_col].str.split(':', expand=True)
-                new_cols.columns = [f'{prefix}-LOC-SITE', f'{prefix}-CAB', f'{prefix}-RU']
+                new_cols.columns = [f'{prefix}-LOC', f'{prefix}-CAB', f'{prefix}-RU']
                 df = pd.concat([df, new_cols], axis=1)
             except Exception as e:
                 print(f"Error splitting column {org_col}: {e}")
@@ -100,10 +92,7 @@ def process_location_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df
 
 def process_dns_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """
-    Applies modular DNS splitting functions (split_dns_cfn and extract_loc_code) 
-    to A/Z DNS columns.
-    """
+    """Applies modular DNS splitting functions to A/Z DNS columns."""
     if org_df is None:
         print("Cannot process DNS columns: Input DataFrame is None.")
         return None
@@ -115,13 +104,9 @@ def process_dns_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     for org_col, prefix in dns_cols_to_split:
         if org_col in df.columns:
             try:
-                # 1. Split CFN from the full DNS name
                 base_dns, cfn = split_dns_cfn(df[org_col].astype(str))
-                
-                # 2. Conditionally split LOC from the Base DNS
                 loc, clean_base_dns = extract_loc_code(base_dns)
 
-                # 3. Create and concatenate new columns
                 new_cols = pd.DataFrame({
                     f'{prefix}-DNS-LOC': loc,
                     f'{prefix}-BASE-DNS': clean_base_dns,
@@ -138,27 +123,31 @@ def process_dns_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df
 
 # ----------------------------------------------------------------------
-# MAIN DRIVER FUNCTION
+# MAIN DRIVER FUNCTION (Modified for API use)
 # ----------------------------------------------------------------------
 
-def execute_cutsheet_processing(file_name: str) -> Optional[pd.DataFrame]:
+def execute_cutsheet_processing(file_content: bytes) -> Optional[pd.DataFrame]:
     """Main driver function to execute the full cutsheet processing workflow."""
-    df = import_cutsheet(file_name)
+    
+    # 1. Import Data (using the modified in-memory function)
+    df = import_cutsheet_from_bytes(file_content)
     if df is None:
-        return None
+        raise HTTPException(status_code=400, detail="Failed to read or parse the CSV file content.")
 
+    # 2. Process Location Columns
     df = process_location_columns(df)
     if df is None:
-        return None
+        raise HTTPException(status_code=500, detail="Failed during location column processing.")
 
+    # 3. Process DNS Columns
     df = process_dns_columns(df)
     if df is None:
-        return None
+        raise HTTPException(status_code=500, detail="Failed during DNS column processing.")
 
     return df
 
 # ==============================================================================
-# FASTAPI ENDPOINT
+# 2. FASTAPI ENDPOINT
 # ==============================================================================
 
 @app.post("/process-cutsheet/")
@@ -182,7 +171,18 @@ async def process_cutsheet_endpoint(file: UploadFile = File(...)):
             raise HTTPException(status_code=500, detail="Processing failed for an unknown reason.")
 
         # Convert the resulting DataFrame to a list of dictionaries (JSON format)
-        return JSONResponse(content=df_processed.to_dict('records'))
+        # return JSONResponse(content=df_processed.to_dict('records'))
+        
+        # json_str = df_processed.to_json(orient='records')
+        # json_data = json.loads(json_str)
+
+        PREVIEW_ROWS = 100
+        preview_df = df_processed.head(PREVIEW_ROWS)
+
+        json_str = preview_df.to_json(orient="records")
+        json_data = json.loads(json_str)
+
+        return JSONResponse(content=json_data)
 
     except HTTPException as e:
         # Re-raise explicit HTTP exceptions from the driver function
