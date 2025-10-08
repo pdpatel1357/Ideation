@@ -10,11 +10,11 @@ import json
 app = FastAPI(title="Data Center Cutsheet Processor")
 
 # ==============================================================================
-# 1. CORE DATA PROCESSING FUNCTIONS (Your existing code)
+# CORE DATA PROCESSING FUNCTIONS
 #    Note: These functions need to be defined *before* the API endpoint uses them.
 # ==============================================================================
 
-# --- 1. Data Import Function (Modified for in-memory processing) ---
+# Data Import Function ---
 
 def import_cutsheet_from_bytes(file_content: bytes) -> Optional[pd.DataFrame]:
     """Reads CSV data from bytes content into a DataFrame."""
@@ -44,7 +44,7 @@ def import_cutsheet_from_bytes(file_content: bytes) -> Optional[pd.DataFrame]:
         return None
 
 # ----------------------------------------------------------------------
-# HELPER FUNCTIONS (No change needed here)
+# HELPER FUNCTIONS
 # ----------------------------------------------------------------------
 
 def split_dns_cfn(dns_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
@@ -65,7 +65,7 @@ def extract_loc_code(base_dns: pd.Series) -> Tuple[pd.Series, pd.Series]:
     return loc, clean_base_dns
 
 # ----------------------------------------------------------------------
-# MAIN PROCESSING STEP FUNCTIONS (Corrected variable name in process_location_columns)
+# MAIN PROCESSING STEP FUNCTIONS
 # ----------------------------------------------------------------------
 
 def process_location_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -123,7 +123,7 @@ def process_dns_columns(org_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df
 
 # ----------------------------------------------------------------------
-# MAIN DRIVER FUNCTION (Modified for API use)
+# MAIN DRIVER FUNCTION
 # ----------------------------------------------------------------------
 
 def execute_cutsheet_processing(file_content: bytes) -> Optional[pd.DataFrame]:
@@ -146,8 +146,25 @@ def execute_cutsheet_processing(file_content: bytes) -> Optional[pd.DataFrame]:
 
     return df
 
+def get_model_count(df: pd.DataFrame) -> Tuple[dict, dict]:
+    if 'A-MODEL' not in df.columns or 'Z-MODEL' not in df.columns:
+        print("Model columns not found in DataFrame.")
+        return {}, {}
+    
+    def calculate_counts(series: pd.Series) -> dict:
+        cleaned_series = series.astype(str).str.strip()
+        cleaned_series = cleaned_series[cleaned_series != 'nan']
+
+        counts = cleaned_series.value_counts()
+        return counts.to_dict()
+    
+    a_model_counts = calculate_counts(df['A-MODEL'])
+    z_model_counts = calculate_counts(df['Z-MODEL'])
+
+    return a_model_counts, z_model_counts
+
 # ==============================================================================
-# 2. FASTAPI ENDPOINT
+# FASTAPI ENDPOINT
 # ==============================================================================
 
 @app.post("/process-cutsheet/")
@@ -189,5 +206,46 @@ async def process_cutsheet_endpoint(file: UploadFile = File(...)):
         raise e
     except Exception as e:
         # Catch unexpected errors during I/O or other steps
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+    
+@app.post("/get-model-inventory/")
+async def get_model_inventory_endpoint(file: UploadFile = File(...)):
+    """
+    Receives a CSV file, processes it, and returns the counts of unique models
+    in the A-MODEL and Z-MODEL columns.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+    
+    try:
+        # Read the file content into bytes
+        file_content = await file.read()
+        
+        # Process the data using the core Python functions
+        df_processed = execute_cutsheet_processing(file_content)
+        
+        if df_processed is None:
+            raise HTTPException(status_code=500, detail="Processing failed before inventory calculation.")
+
+        # Get model counts
+        a_inventory, z_inventory = get_model_count(df_processed)
+        total_unique_a = len(a_inventory)
+        total_unique_z = len(z_inventory)
+        total_a_devices = sum(a_inventory.values())
+        total_z_devices = sum(z_inventory.values())
+
+        return JSONResponse(content={
+            "Total Unique A-MODEL Devices": total_unique_a,
+            "Total A-MODEL Devices": total_a_devices,
+            "A-MODEL Device Inventory": a_inventory,
+            "Total Unique Z-MODEL Devices": total_unique_z,
+            "Total Z-MODEL Devices": total_z_devices,
+            "Z-MODEL Device Inventory": z_inventory
+        })
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
