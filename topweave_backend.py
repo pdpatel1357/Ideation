@@ -1,7 +1,7 @@
 import pandas as pd
 import os
 import io
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import json
@@ -36,6 +36,9 @@ def import_cutsheet_from_bytes(file_content: bytes) -> Optional[pd.DataFrame]:
 
         df_filtered = df[df['A-SIDE LOCODE'].notna()].copy()
         df_filtered = df_filtered.reset_index(drop=True)
+
+        for col in df_filtered.select_dtypes(include=['object']).columns:
+            df_filtered[col] = df_filtered[col].str.lower()
         
         return df_filtered
     except Exception as e:
@@ -163,6 +166,92 @@ def get_model_count(df: pd.DataFrame) -> Tuple[dict, dict]:
 
     return a_model_counts, z_model_counts
 
+def create_graph_data(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Transforms the processed DataFrame into a list of Nodes and a list of Edges
+    suitable for graph visualization.
+    """
+    if df is None or df.empty:
+        print("Input DataFrame is None or empty.")
+        return [], []
+    
+    nodes: Dict[str, Dict[str, Any]] = {}
+    edges: List[Dict[str, Any]] = []
+
+    # Helper function to ensure we get a clean string or the specific 'NaN' string
+    def get_clean_value(value):
+        """Checks for NaN and returns 'NaN' string, otherwise converts to stripped string."""
+        if pd.isna(value):
+            return 'NaN'
+        # Convert to string and strip any lingering whitespace.
+        # Note: Lowercasing is handled in the execute_cutsheet_processing pipeline.
+        return str(value).strip()
+
+    device_id_cols = {
+        'A': ['A-LOC:CAB:RU', 'A-BASE-DNS', 'A-MODEL', 'A-PORT', 'A-OPTIC'],
+        'Z': ['Z-LOC:CAB:RU', 'Z-BASE-DNS', 'Z-MODEL', 'Z-PORT', 'Z-OPTIC']
+    }
+
+    for index, row in df.iterrows():
+        # a_loc = row['A-LOC:CAB:RU'].strip()
+        # a_dns = row['A-BASE-DNS'].strip()
+        # a_node_id = f"{a_dns}-{a_loc}"
+        a_loc = get_clean_value(row['A-LOC:CAB:RU'])
+        a_dns = get_clean_value(row['A-BASE-DNS'])
+        a_node_id = f"{a_dns}-{a_loc}"
+
+
+        if a_node_id not in nodes:
+            nodes[a_node_id] = {
+                'id': a_node_id,
+                'location': a_loc,
+                'base_dns': a_dns,
+                # 'model': row['A-MODEL'].strip(),
+                'model': get_clean_value(row['A-MODEL']),
+                'side': 'A'
+            }
+        
+        # z_loc = row['Z-LOC:CAB:RU'].strip()
+        # z_dns = row['Z-BASE-DNS'].strip()
+        # z_node_id = f"{z_dns}-{z_loc}"
+        z_loc = get_clean_value(row['Z-LOC:CAB:RU'])
+        z_dns = get_clean_value(row['Z-BASE-DNS'])
+        z_node_id = f"{z_dns}-{z_loc}"
+
+        if z_node_id not in nodes:
+            nodes[z_node_id] = {
+                'id': z_node_id,
+                'location': z_loc,
+                'base_dns': z_dns,
+                # 'model': row['Z-MODEL'].strip(),
+                'model': get_clean_value(row['Z-MODEL']),
+                'side': 'Z'
+            }
+        elif nodes[z_node_id]['side'] == 'A':
+            nodes[z_node_id]['side'] = 'Both'
+
+        edge_id = f"{a_node_id} <-> {z_node_id}"
+        edges.append({
+            'id': edge_id,
+            'source': a_node_id,
+            'target': z_node_id,
+            # 'a_port': row['A-PORT'].strip(),
+            # 'a_optic': row['A-OPTIC'].strip(),
+            # 'z_port': row['Z-PORT'].strip(),
+            # 'z_optic': row['Z-OPTIC'].strip(),
+            # 'cable': row['CABLE'].strip()
+            'a_port': get_clean_value(row['A-PORT']),
+            'a_optic': get_clean_value(row['A-OPTIC']),
+            'z_port': get_clean_value(row['Z-PORT']),
+            'z_optic': get_clean_value(row['Z-OPTIC']),
+            'cable': get_clean_value(row['CABLE'])
+        })
+
+        if nodes[a_node_id]['side'] == 'Z':
+            nodes[a_node_id]['side'] = 'Both'
+        
+    return list(nodes.values()), edges
+
 # ==============================================================================
 # FASTAPI ENDPOINT
 # ==============================================================================
@@ -230,6 +319,12 @@ async def get_model_inventory_endpoint(file: UploadFile = File(...)):
 
         # Get model counts
         a_inventory, z_inventory = get_model_count(df_processed)
+
+        a_models = set(a_inventory.keys())
+        z_models = set(z_inventory.keys())
+        combined_unique_models = a_models | z_models
+        total_combined_unique = len(combined_unique_models)
+
         total_unique_a = len(a_inventory)
         total_unique_z = len(z_inventory)
         total_a_devices = sum(a_inventory.values())
@@ -241,11 +336,78 @@ async def get_model_inventory_endpoint(file: UploadFile = File(...)):
             "A-MODEL Device Inventory": a_inventory,
             "Total Unique Z-MODEL Devices": total_unique_z,
             "Total Z-MODEL Devices": total_z_devices,
-            "Z-MODEL Device Inventory": z_inventory
+            "Z-MODEL Device Inventory": z_inventory,
+
+            "Total Combined Unique Models (A or Z)": total_combined_unique,
+            "Combined Unique Model List": list(combined_unique_models)
         })
 
     except HTTPException as e:
         raise e
     except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+@app.post("/get-graph-data/")
+async def get_graph_data_endpoint(file: UploadFile = File(...)):
+    """
+    Receives a CSV file, processes it, and returns the data structured as 
+    Nodes and Edges for graph visualization.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+    
+    try:
+        # Read the file content into bytes
+        file_content = await file.read()
+        
+        # Process the data using the core Python functions
+        # This returns the fully processed DataFrame
+        df_processed = execute_cutsheet_processing(file_content)
+        
+        if df_processed is None:
+            raise HTTPException(status_code=500, detail="Processing failed before graph data creation.")
+
+        # # Transform DataFrame into Nodes and Edges
+        # nodes, edges = create_graph_data(df_processed)
+
+        # return JSONResponse(content={
+        #     "nodes": nodes,
+        #     "edges": edges
+        # })
+        
+        all_nodes, all_edges = create_graph_data(df_processed)
+
+        MAX_EDGES = 100
+        
+        # 1. Limit the edges list (take the first N edges)
+        limited_edges = all_edges[:MAX_EDGES]
+        
+        # 2. Identify all unique node IDs present in the limited edges
+        # This ensures we only return nodes that are actually connected in the preview graph
+        involved_node_ids = set()
+        for edge in limited_edges:
+            involved_node_ids.add(edge['source'])
+            involved_node_ids.add(edge['target'])
+            
+        # 3. Filter the full list of nodes based on the involved IDs
+        limited_nodes = [
+            node for node in all_nodes
+            if node['id'] in involved_node_ids
+        ]
+        
+        print(f"Graph Data Limited: Returning {len(limited_nodes)} nodes and {len(limited_edges)} edges.")
+        # ----------------------------------------------------------------------
+
+        return JSONResponse(content={
+            "nodes": limited_nodes,
+            "edges": limited_edges
+        })
+
+    except HTTPException as e:
+        # Re-raise explicit HTTP exceptions
+        raise e
+    except Exception as e:
+        # Catch unexpected errors
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
